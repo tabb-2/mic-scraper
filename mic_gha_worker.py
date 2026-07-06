@@ -223,15 +223,18 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
             supplier_id = m.group(1)
             t = a.get_text(strip=True)
             if t:
-                supplier_name = t[:100]
+                supplier_name = t[:200]
             break
     # Если имя не нашли через ссылку — ищем в блоке поставщика
     if not supplier_name:
         for cls in ["company-name", "companyName", "supplier-name", "factory-name"]:
             el = card.find(class_=re.compile(cls, re.I))
             if el:
-                supplier_name = el.get_text(strip=True)[:100]
+                supplier_name = el.get_text(strip=True)[:200]
                 break
+    # Убрать мусор после имени компании (Diamond Member, Audited Supplier и т.д.)
+    if supplier_name:
+        supplier_name = re.split(r"(Diamond|Audited|Gold|Verified|Member|Supplier)\b", supplier_name)[0].strip()[:100]
 
     # Transaction level (объём заказов) — сигнал популярности
     transaction_level = None
