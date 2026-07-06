@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       batch_size:
-        description: "Категорий за один run (default: 60)"
+        description: "Categories per run (default: 60)"
         required: false
         default: "60"
 
@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 370
 
     steps:
-      - name: Random delay (human-like timing)
+      - name: Random delay
         if: github.event_name == 'schedule'
         run: sleep $((RANDOM % 3600))
 
@@ -33,91 +33,26 @@ jobs:
 
       - name: Check S3 progress
         env:
-          YC_ACCESS_KEY_ID:     ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
           YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-        run: |
-          python3 - <<'EOF'
-          import boto3, json, os, sys
-
-          s3 = boto3.client(
-              "s3",
-              endpoint_url="https://storage.yandexcloud.net",
-              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
-              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
-              region_name="ru-central1",
-          )
-          try:
-              cp = json.loads(s3.get_object(Bucket="tebiz-data", Key="parsed/mic/checkpoint.json")["Body"].read())
-              cats = json.loads(s3.get_object(Bucket="tebiz-data", Key="parsed/mic/categories.json")["Body"].read())
-              done = len(cp.get("done_cats", []))
-              total = len(cats)
-              remaining = total - done
-              print(f"Progress: {done}/{total} categories done, {remaining} remaining")
-              if remaining == 0:
-                  print("::notice::All categories complete!")
-                  sys.exit(0)
-          except Exception as e:
-              print(f"Could not read progress: {e}")
-          EOF
+        run: python3 mic_check_progress.py
 
       - name: Run MIC worker
         env:
-          YC_ACCESS_KEY_ID:     ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
           YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET:            tebiz-data
-          S3_PREFIX:            parsed/mic
-          BATCH_SIZE:           ${{ github.event.inputs.batch_size || '60' }}
-          MAX_RUNTIME_MIN:      "300"
+          YC_BUCKET: tebiz-data
+          S3_PREFIX: parsed/mic
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '60' }}
+          MAX_RUNTIME_MIN: "300"
         run: python3 mic_gha_worker.py
 
       - name: Notify Telegram
         if: always()
         env:
-          YC_ACCESS_KEY_ID:     ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
           YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          TG_BOT_TOKEN:         ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:           ${{ secrets.TG_CHAT_ID }}
-          RUN_STATUS:           ${{ job.status }}
-        run: |
-          python3 - <<'EOF'
-          import boto3, json, os, urllib.request, urllib.parse
-
-          s3 = boto3.client(
-              "s3",
-              endpoint_url="https://storage.yandexcloud.net",
-              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
-              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
-              region_name="ru-central1",
-          )
-          try:
-              cp = json.loads(s3.get_object(Bucket="tebiz-data", Key="parsed/mic/checkpoint.json")["Body"].read())
-              cats = json.loads(s3.get_object(Bucket="tebiz-data", Key="parsed/mic/categories.json")["Body"].read())
-              done = len(cp.get("done_cats", []))
-              total = len(cats)
-              pct = round(done / total * 100, 1)
-              bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
-              status = os.environ.get("RUN_STATUS", "unknown")
-              emoji = "✅" if status == "success" else "❌"
-              msg = (
-                  f"{emoji} MIC Scraper
-"
-                  f"{bar} {pct}%
-"
-                  f"{done}/{total} категорий
-"
-                  f"Осталось: {total - done}"
-              )
-              if done == total:
-                  msg = "🎉 MIC Scraper ГОТОВО!
-Все категории собраны."
-          except Exception as e:
-              msg = f"⚠️ MIC Scraper: не удалось прочитать прогресс
-{e}"
-
-          token = os.environ["TG_BOT_TOKEN"]
-          chat_id = os.environ["TG_CHAT_ID"]
-          data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg}).encode()
-          req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
-          urllib.request.urlopen(req)
-          print("TG sent:", msg)
-          EOF
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+        run: python3 mic_notify.py
