@@ -1,0 +1,101 @@
+name: MIC Scraper
+
+on:
+  schedule:
+    # Раз в 12 часов — умеренно, не привлекает внимания
+    - cron: "0 3,15 * * *"
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Категорий за один run (default: 60)"
+        required: false
+        default: "60"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # буфер сверх MAX_RUNTIME_MIN=300
+
+    steps:
+      - name: Random delay (avoid predictable timing)
+        if: github.event_name == 'schedule'
+        run: sleep $((RANDOM % 1800))
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install boto3==1.34.101 beautifulsoup4==4.12.3 lxml==5.2.1
+
+      - name: Check S3 progress
+        env:
+          YC_ACCESS_KEY_ID:     ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+        run: |
+          python3 - <<'EOF'
+          import boto3, json, os
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url="https://storage.yandexcloud.net",
+              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
+              region_name="ru-central1",
+          )
+          try:
+              cp = json.loads(s3.get_object(Bucket="tebiz-data", Key="parsed/mic/checkpoint.json")["Body"].read())
+              cats = json.loads(s3.get_object(Bucket="tebiz-data", Key="parsed/mic/categories.json")["Body"].read())
+              done = len(cp.get("done_cats", []))
+              total = len(cats)
+              remaining = total - done
+              print(f"Progress: {done}/{total} categories done, {remaining} remaining")
+              if remaining == 0:
+                  print("::notice::All categories complete! Skipping run.")
+                  import sys; sys.exit(0)
+          except Exception as e:
+              print(f"Could not read progress: {e}")
+          EOF
+
+      - name: Run MIC worker
+        env:
+          YC_ACCESS_KEY_ID:     ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET:            tebiz-data
+          S3_PREFIX:            parsed/mic
+          BATCH_SIZE:           ${{ github.event.inputs.batch_size || '60' }}
+          MAX_RUNTIME_MIN:      "300"
+        run: python3 mic_gha_worker.py
+
+      - name: Report progress
+        if: always()
+        env:
+          YC_ACCESS_KEY_ID:     ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+        run: |
+          python3 - <<'EOF'
+          import boto3, json, os
+          try:
+              s3 = boto3.client(
+                  "s3",
+                  endpoint_url="https://storage.yandexcloud.net",
+                  aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
+                  aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
+                  region_name="ru-central1",
+              )
+              cp = json.loads(s3.get_object(Bucket="tebiz-data", Key="parsed/mic/checkpoint.json")["Body"].read())
+              cats = json.loads(s3.get_object(Bucket="tebiz-data", Key="parsed/mic/categories.json")["Body"].read())
+              done = len(cp.get("done_cats", []))
+              total = len(cats)
+              pct = round(done / total * 100, 1)
+              print(f"=== FINAL STATUS: {done}/{total} ({pct}%) ===")
+              if done == total:
+                  print("::notice::COMPLETE! All categories scraped.")
+          except Exception as e:
+              print(f"Could not report: {e}")
+          EOF
