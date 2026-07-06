@@ -235,10 +235,16 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
     # Убрать мусор после имени компании (Diamond Member, Audited Supplier и т.д.)
     if supplier_name:
         supplier_name = re.split(r"(Diamond|Audited|Gold|Verified|Member)\b", supplier_name)[0].strip()
-        # Убрать дублирование: "Foo Co.Foo Co." → "Foo Co."
-        half = len(supplier_name) // 2
-        if half > 5 and supplier_name[:half] == supplier_name[half:]:
-            supplier_name = supplier_name[:half]
+        # Убрать дублирование: "Foo Co.Foo Co." → "Foo Co." (в т.ч. усечённое)
+        # Ищем первые 15 символов во второй половине строки
+        key = supplier_name[:15]
+        second = supplier_name.find(key, 10)
+        if second > 0:
+            supplier_name = supplier_name[:second]
+        else:
+            half = len(supplier_name) // 2
+            if half > 5 and supplier_name[:half] == supplier_name[half:]:
+                supplier_name = supplier_name[:half]
         supplier_name = supplier_name.strip("., ")[:100]
 
     # Transaction level (объём заказов) — сигнал популярности
