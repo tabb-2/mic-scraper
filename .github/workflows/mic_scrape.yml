@@ -2,7 +2,7 @@ name: MIC Scraper
 
 on:
   schedule:
-    - cron: "0 0,6,12,18 * * *"
+    - cron: "0 1 * * *"
   workflow_dispatch:
     inputs:
       batch_size:
@@ -13,12 +13,12 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 370
 
     steps:
-      - name: Random delay (avoid predictable timing)
+      - name: Random delay (human-like timing)
         if: github.event_name == 'schedule'
-        run: sleep $((RANDOM % 1800))
+        run: sleep $((RANDOM % 3600))
 
       - name: Checkout
         uses: actions/checkout@v4
