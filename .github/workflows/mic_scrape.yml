@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       batch_size:
-        description: "Categories per run (default: 60)"
+        description: "Categories per run (default: 999)"
         required: false
-        default: "60"
+        default: "999"
 
 jobs:
   scrape:
@@ -43,7 +43,7 @@ jobs:
           YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
           YC_BUCKET: tebiz-data
           S3_PREFIX: parsed/mic
-          BATCH_SIZE: ${{ github.event.inputs.batch_size || '60' }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '999' }}
           MAX_RUNTIME_MIN: "300"
         run: python3 mic_gha_worker.py
 
