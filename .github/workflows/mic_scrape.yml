@@ -10,6 +10,11 @@ on:
         required: false
         default: "999"
 
+# Запрещает два run параллельно — без этого оба пишут в одну checkpoint
+concurrency:
+  group: mic-scraper
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -29,7 +34,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install boto3==1.34.101 beautifulsoup4==4.12.3 lxml==5.2.1
+        run: pip install boto3==1.34.101 beautifulsoup4==4.12.3 lxml==5.2.1 tenacity==8.2.3
+
+      - name: Download checkpoint artifact (resume after crash/cancel)
+        uses: actions/download-artifact@v4
+        with:
+          name: mic-checkpoint
+          path: .
+        continue-on-error: true
 
       - name: Check S3 progress
         env:
@@ -45,7 +57,17 @@ jobs:
           S3_PREFIX: parsed/mic
           BATCH_SIZE: ${{ github.event.inputs.batch_size || '999' }}
           MAX_RUNTIME_MIN: "300"
+          CHECKPOINT_ARTIFACT: checkpoint_artifact.json
         run: python3 mic_gha_worker.py
+
+      - name: Upload checkpoint artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mic-checkpoint
+          path: checkpoint_artifact.json
+          retention-days: 7
+          overwrite: true
 
       - name: Notify Telegram
         if: always()
