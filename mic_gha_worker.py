@@ -9,13 +9,14 @@ mic_gha_worker.py — GitHub Actions worker для парсинга MIC.
   YC_SECRET_ACCESS_KEY  — S3 secret key
   YC_BUCKET             — имя бакета (default: tebiz-data)
   S3_PREFIX             — префикс в бакете (default: parsed/mic)
-  BATCH_SIZE            — категорий за один run (default: 60)
+  BATCH_SIZE            — категорий за один run (default: 999)
   MAX_RUNTIME_MIN       — лимит минут на run (default: 300)
   PAGES_PER_CAT         — страниц на категорию (default: 3, 0 = все)
 """
 
 import gzip
 import json
+import logging
 import os
 import random
 import re
@@ -23,7 +24,7 @@ import sys
 import time
 from datetime import datetime
 from typing import Optional
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
@@ -37,11 +38,31 @@ try:
 except ImportError:
     sys.exit("pip install beautifulsoup4")
 
+try:
+    from tenacity import (
+        retry,
+        retry_if_exception_type,
+        stop_after_attempt,
+        wait_exponential,
+        wait_random,
+    )
+except ImportError:
+    sys.exit("pip install tenacity")
+
+# ── Structured logging ────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+_log = logging.getLogger(__name__)
+
+
+def log(event: str, **kw):
+    _log.info(json.dumps({"ts": datetime.utcnow().isoformat(), "event": event, **kw}))
+
+
 # ── Конфиг ────────────────────────────────────────────────────────────────────
 YC_ENDPOINT   = "https://storage.yandexcloud.net"
 BUCKET        = os.environ.get("YC_BUCKET", "tebiz-data")
 S3_PREFIX     = os.environ.get("S3_PREFIX", "parsed/mic").rstrip("/")
-BATCH_SIZE    = int(os.environ.get("BATCH_SIZE", "60"))
+BATCH_SIZE    = int(os.environ.get("BATCH_SIZE", "999"))
 MAX_RUNTIME_S = int(os.environ.get("MAX_RUNTIME_MIN", "300")) * 60
 PAGES_PER_CAT = int(os.environ.get("PAGES_PER_CAT", "3"))  # 0 = все страницы
 
@@ -93,56 +114,89 @@ def s3_get_json(key: str) -> Optional[dict]:
     return json.loads(raw) if raw else None
 
 
-# ── HTTP ───────────────────────────────────────────────────────────────────────
-def _get(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
-    for attempt in range(retries):
-        try:
-            req = Request(url, headers={
-                "User-Agent":      random.choice(USER_AGENTS),
-                "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate",
-                "Connection":      "keep-alive",
-                "Referer":         BASE + "/",
-            })
-            with urlopen(req, timeout=TIMEOUT) as r:
-                raw = r.read()
-                if r.headers.get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
-                    raw = gzip.decompress(raw)
-                return raw.decode("utf-8", errors="replace")
-        except Exception as e:
-            if attempt < retries - 1:
-                wait = DELAY_MAX * (attempt + 1)
-                print(f"  retry {attempt+1}/{retries}: {e} (wait {wait:.0f}s)")
-                time.sleep(wait)
-            else:
-                print(f"  FAIL {url}: {e}")
-                return None
-    return None
+# ── HTTP (tenacity retry + jitter) ────────────────────────────────────────────
+def _should_retry(exc: BaseException) -> bool:
+    if isinstance(exc, HTTPError):
+        # не ретраить клиентские ошибки кроме 429/408
+        return exc.code in (408, 429, 500, 502, 503, 504)
+    return isinstance(exc, (URLError, OSError, TimeoutError))
+
+
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random(0, 2),
+    retry=retry_if_exception_type((HTTPError, URLError, OSError, TimeoutError)),
+    reraise=True,
+)
+def _fetch_raw(url: str) -> str:
+    t0 = time.time()
+    req = Request(url, headers={
+        "User-Agent":      random.choice(USER_AGENTS),
+        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection":      "keep-alive",
+        "Referer":         BASE + "/",
+    })
+    with urlopen(req, timeout=TIMEOUT) as r:
+        raw = r.read()
+        if r.headers.get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        elapsed = round((time.time() - t0) * 1000)
+        log("fetch", url=url, status=r.status, elapsed_ms=elapsed)
+        return raw.decode("utf-8", errors="replace")
+
+
+def _get(url: str) -> Optional[str]:
+    try:
+        return _fetch_raw(url)
+    except Exception as e:
+        log("fetch_failed", url=url, error=str(e))
+        return None
 
 
 def _sleep():
     time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
 
+# ── Локальный checkpoint (артефакт GHA) ───────────────────────────────────────
+ARTIFACT_PATH = os.environ.get("CHECKPOINT_ARTIFACT", "checkpoint_artifact.json")
+
+
+def load_artifact_checkpoint() -> Optional[dict]:
+    if os.path.exists(ARTIFACT_PATH):
+        try:
+            with open(ARTIFACT_PATH) as f:
+                cp = json.load(f)
+            log("artifact_checkpoint_loaded", path=ARTIFACT_PATH, done=len(cp.get("done_cats", [])))
+            return cp
+        except Exception as e:
+            log("artifact_checkpoint_error", error=str(e))
+    return None
+
+
+def save_artifact_checkpoint(cp: dict):
+    try:
+        with open(ARTIFACT_PATH, "w") as f:
+            json.dump(cp, f)
+    except Exception as e:
+        log("artifact_checkpoint_save_error", error=str(e))
+
+
 # ── Пагинация ─────────────────────────────────────────────────────────────────
 def _page_url(base_url: str, page: int) -> str:
-    """MIC pagination: slug.html → slug-p2.html, slug-p3.html ..."""
     if page == 1:
         return base_url
-    # вставить -pN перед .html
     if base_url.endswith(".html"):
         return base_url[:-5] + f"-p{page}.html"
     return base_url + f"?page={page}"
 
 
 def _detect_last_page(soup) -> int:
-    """Найти последнюю страницу из пагинатора MIC."""
     for el in soup.find_all(class_=re.compile(r"total-page|page-total|total_page", re.I)):
         m = re.search(r"(\d+)", el.get_text())
         if m:
             return int(m.group(1))
-    # fallback: смотрим ссылки пагинации
     pages = []
     for a in soup.find_all("a", href=re.compile(r"-p(\d+)\.html")):
         m = re.search(r"-p(\d+)\.html", a["href"])
@@ -153,7 +207,6 @@ def _detect_last_page(soup) -> int:
 
 # ── Парсинг карточки ───────────────────────────────────────────────────────────
 def _parse_card(card, cat_id: str) -> Optional[dict]:
-    # SKU ID + URL
     url = sku = ""
     for a in card.find_all("a", href=True):
         m = re.search(r"/product/([A-Za-z0-9]+)", a["href"])
@@ -165,7 +218,6 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
     if not sku:
         sku = "unk_" + str(abs(hash(card.get_text())))[:8]
 
-    # Название
     name = ""
     for a in card.find_all("a", title=True):
         t = a["title"].strip()
@@ -179,7 +231,6 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
                 name = el.get_text(strip=True)[:200]
                 break
 
-    # Цена
     price_min = price_max = None
     price_unit = "piece"
     for cls in ["price", "proPrice", "pro-price"]:
@@ -195,7 +246,6 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
                     pass
             if vals:
                 price_min, price_max = min(vals), max(vals)
-            # Единица измерения
             text = price_el.get_text(" ", strip=True)
             if re.search(r"\bset\b", text, re.I):
                 price_unit = "set"
@@ -205,7 +255,6 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
                 price_unit = "piece"
             break
 
-    # MOQ
     moq = None
     text = card.get_text(" ", strip=True)
     m = re.search(r"MOQ[:\s]*([\d,]+)", text, re.I)
@@ -215,7 +264,6 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
         except ValueError:
             pass
 
-    # Поставщик — supplier_id и supplier_name
     supplier_id = supplier_name = ""
     for a in card.find_all("a", href=True):
         m = re.search(r"//([a-z0-9-]+)\.en\.made-in-china\.com", a["href"])
@@ -225,18 +273,14 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
             if t:
                 supplier_name = t[:200]
             break
-    # Если имя не нашли через ссылку — ищем в блоке поставщика
     if not supplier_name:
         for cls in ["company-name", "companyName", "supplier-name", "factory-name"]:
             el = card.find(class_=re.compile(cls, re.I))
             if el:
                 supplier_name = el.get_text(strip=True)[:200]
                 break
-    # Убрать мусор после имени компании (Diamond Member, Audited Supplier и т.д.)
     if supplier_name:
         supplier_name = re.split(r"(Diamond|Audited|Gold|Verified|Member)\b", supplier_name)[0].strip()
-        # Убрать дублирование: "Foo Co.Foo Co." → "Foo Co." (в т.ч. усечённое)
-        # Ищем первые 15 символов во второй половине строки
         key = supplier_name[:15]
         second = supplier_name.find(key, 10)
         if second > 0:
@@ -247,7 +291,6 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
                 supplier_name = supplier_name[:half]
         supplier_name = supplier_name.strip("., ")[:100]
 
-    # Transaction level (объём заказов) — сигнал популярности
     transaction_level = None
     for cls in ["transaction-level", "transactionLevel", "trade-level"]:
         el = card.find(class_=re.compile(cls, re.I))
@@ -259,13 +302,11 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
         if m:
             transaction_level = m.group(0)
 
-    # Response rate
     response_rate = None
     m = re.search(r"(\d+)%\s*response", text, re.I)
     if m:
         response_rate = int(m.group(1))
 
-    # Сертификаты (CE, RoHS, ISO и т.д.)
     certifications = []
     cert_pattern = re.compile(r"\b(CE|RoHS|ISO\s*\d+|FDA|REACH|ASTM|UL|GS|BV)\b")
     for c in cert_pattern.findall(text):
@@ -290,7 +331,7 @@ def _parse_card(card, cat_id: str) -> Optional[dict]:
     }
 
 
-# ── Парсинг категории (с пагинацией) ─────────────────────────────────────────
+# ── Парсинг категории ─────────────────────────────────────────────────────────
 def fetch_products(cat: dict) -> list:
     slug = cat["category_id"]
     if slug.startswith("top_") or slug.startswith("sub_"):
@@ -299,7 +340,6 @@ def fetch_products(cat: dict) -> list:
     base_url = f"{BASE}/products-search/hot-china-products/{slug}.html"
     fallback_url = cat.get("url", "")
 
-    # Получаем первую страницу
     html = _get(base_url)
     if not html or len(html) < 5000:
         if fallback_url:
@@ -313,7 +353,6 @@ def fetch_products(cat: dict) -> list:
     if not cards:
         return []
 
-    # Определяем сколько страниц собирать
     last_page = _detect_last_page(soup)
     pages_limit = PAGES_PER_CAT if PAGES_PER_CAT > 0 else last_page
     pages_to_fetch = min(pages_limit, last_page)
@@ -331,7 +370,6 @@ def fetch_products(cat: dict) -> list:
 
     _extract(soup)
 
-    # Страницы 2, 3, ...
     for page in range(2, pages_to_fetch + 1):
         purl = _page_url(base_url, page)
         _sleep()
@@ -342,7 +380,7 @@ def fetch_products(cat: dict) -> list:
         before = len(products)
         _extract(soup2)
         if len(products) == before:
-            break  # пустая страница — дальше нет смысла
+            break
 
     return products
 
@@ -350,20 +388,27 @@ def fetch_products(cat: dict) -> list:
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     start_time = time.time()
-    print(f"=== MIC GHA Worker {datetime.now().isoformat()} ===")
-    print(f"Bucket: {BUCKET}/{S3_PREFIX}  batch={BATCH_SIZE}  pages/cat={PAGES_PER_CAT or 'all'}  max={MAX_RUNTIME_S//60}min")
+    log("run_start", batch=BATCH_SIZE, pages_per_cat=PAGES_PER_CAT, max_min=MAX_RUNTIME_S // 60)
 
-    cp = s3_get_json("checkpoint.json") or {"done_cats": [], "suppliers": {}}
+    # Checkpoint: S3 (основной) или GHA artifact (резерв при S3 недоступен)
+    cp = s3_get_json("checkpoint.json")
+    if cp is None:
+        cp = load_artifact_checkpoint()
+    if cp is None:
+        cp = {"done_cats": [], "suppliers": {}}
+
     categories = s3_get_json("categories.json")
     if not categories:
         sys.exit("categories.json не найден в S3")
 
     done_set = set(cp["done_cats"])
     todo = [c for c in categories if c.get("is_leaf", True) and c["category_id"] not in done_set]
-    print(f"Осталось: {len(todo)}/{len(categories)} категорий")
+
+    total = len(categories)
+    log("progress", done=len(done_set), total=total, remaining=len(todo))
 
     if not todo:
-        print("Всё готово!")
+        log("run_complete", message="All categories scraped")
         _build_index(categories)
         return
 
@@ -371,33 +416,50 @@ def main():
     for cat in todo[:BATCH_SIZE]:
         elapsed = time.time() - start_time
         if elapsed > MAX_RUNTIME_S - 120:
-            print(f"Лимит времени ({MAX_RUNTIME_S//60} мин). Сохраняем...")
+            log("time_limit", elapsed_min=round(elapsed / 60, 1))
             break
 
         cid = cat["category_id"]
-        print(f"[{processed+1}/{min(BATCH_SIZE, len(todo))}] {cat['name_en'][:50]}")
+        t0 = time.time()
         products = fetch_products(cat)
         n_with_price = sum(1 for p in products if p.get("fob_price_usd"))
         n_with_supplier = sum(1 for p in products if p.get("supplier_name"))
-        print(f"  → {len(products)} SKU  (цена: {n_with_price}, поставщик: {n_with_supplier})")
+
+        log("category_done",
+            name=cat["name_en"][:50],
+            skus=len(products),
+            priced=n_with_price,
+            with_supplier=n_with_supplier,
+            elapsed_ms=round((time.time() - t0) * 1000),
+            batch_n=processed + 1)
 
         s3_put_json(f"products_{cid}.json", products)
         cp["done_cats"].append(cid)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        s3_put_json(f"checkpoint_{today}.json", cp)
         s3_put_json("checkpoint.json", cp)
+        save_artifact_checkpoint(cp)  # локальная копия для GHA artifact
         processed += 1
         _sleep()
 
     elapsed = time.time() - start_time
     remaining = len(todo) - processed
-    print(f"\n✓ Обработано: {processed}  Осталось: {remaining}  Время: {elapsed/60:.1f} мин")
-    print(f"Прогресс: {len(cp['done_cats'])}/{len(categories)} категорий")
+    pct = round(len(cp["done_cats"]) / total * 100, 1)
+
+    log("run_end",
+        processed=processed,
+        remaining=remaining,
+        done_total=len(cp["done_cats"]),
+        total=total,
+        pct=pct,
+        elapsed_min=round(elapsed / 60, 1))
 
     if remaining == 0:
         _build_index(categories)
 
 
 def _build_index(categories: list):
-    print("\nСтрою mic_index.json...")
+    log("build_index_start", categories=len(categories))
     index = {}
     for cat in categories:
         raw = s3_get_json(f"products_{cat['category_id']}.json")
@@ -424,7 +486,7 @@ def _build_index(categories: list):
             "certifications": certs,
         }
     s3_put_json("mic_index.json", index)
-    print(f"✓ mic_index.json → {len(index)} категорий")
+    log("build_index_done", indexed=len(index))
 
 
 if __name__ == "__main__":
