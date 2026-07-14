@@ -1,6 +1,8 @@
 name: MIC Enrich
 
 on:
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       batch_cats:
