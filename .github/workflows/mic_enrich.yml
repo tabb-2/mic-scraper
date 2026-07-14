@@ -1,8 +1,6 @@
 name: MIC Enrich
 
 on:
-  schedule:
-    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       batch_cats:
@@ -36,7 +34,9 @@ jobs:
         run: pip install boto3==1.34.101 playwright==1.44.0 tenacity==8.2.3
 
       - name: Install Playwright browsers
-        run: playwright install chromium --with-deps
+        run: |
+          python -m playwright install chromium
+          sudo python -m playwright install-deps chromium
 
       - name: Run enricher
         env:
